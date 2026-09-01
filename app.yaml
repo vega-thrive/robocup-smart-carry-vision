@@ -1,0 +1,8 @@
+id: lyh_8_13
+name: 椭圆算法视觉
+version: 1.0.0
+author: lyh
+icon: app.png
+desc: lyh
+files:
+  - main.py
