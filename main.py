@@ -196,6 +196,90 @@ def detect_circle_2(img,MIN_AREA):
     return current_pos
 # ============== 结束圆检测部分 ==============
 
+# ============== OCR识别部分（任务05：冠/亚/季，支持任意角度） ==============
+OCR_MODEL = "/root/models/pp_ocr.mud"
+TARGETS = {"冠": 11, "亚": 22, "季": 33}   # 字符 -> 串口码
+SCORE_TH = 0.6       # 置信度阈值，低于视为未识别
+CONFIRM_FRAMES = 3   # 连续确认帧数，防闪烁
+TRACK_SCALE = 1.8    # 跟踪窗相对检测框的放大倍数
+LOST_RESET = 3       # 跟踪连续丢失帧数，超限回退全图搜索
+REFRESH_EVERY = 10   # 跟踪中每N帧强制全图刷新一次坐标
+GRID_EVERY = 3       # 全角度兜底网格限频：每N帧才跑一次（空场景防烧算力）
+
+ocr = None
+ocr_font_loaded = False
+ocr_font_ok = False
+
+def ensure_ocr():
+    """懒加载OCR模型：任务05才初始化，避免模型缺失影响其他任务启动"""
+    global ocr, ocr_font_loaded, ocr_font_ok
+    if ocr is None:
+        ocr = nn.PP_OCR(OCR_MODEL)
+    if not ocr_font_loaded:
+        try:
+            image.load_font("ppocr", "/maixapp/share/font/ppocr_keys_v1.ttf", size=20)
+            image.set_default_font("ppocr")
+            ocr_font_ok = True
+        except Exception:
+            ocr_font_ok = False  # 字体缺失只影响屏幕显示，不影响识别和串口
+        ocr_font_loaded = True
+    return ocr
+
+def normalize_points(pts):
+    """兼容点对列表和扁平坐标两种to_list返回"""
+    if pts and isinstance(pts[0], (list, tuple)):
+        return pts
+    return list(zip(pts[0::2], pts[1::2]))
+
+def _rotate_frame_cv2(img_bgr, angle):
+    """cv2旋转整帧（紧致画布防裁剪），供旋转重检使用"""
+    img_cv = image.image2cv(img_bgr)  # BGR
+    h, w = img_cv.shape[:2]
+    rad = math.radians(angle % 360)
+    cos_a = abs(math.cos(rad))
+    sin_a = abs(math.sin(rad))
+    new_w = int(w * cos_a + h * sin_a)
+    new_h = int(w * sin_a + h * cos_a)
+    M = cv2.getRotationMatrix2D((w / 2, h / 2), angle % 360, 1.0)
+    M[0, 2] += (new_w - w) / 2
+    M[1, 2] += (new_h - h) / 2
+    rot = cv2.warpAffine(img_cv, M, (new_w, new_h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+    return image.cv2image(rot)
+
+def _match_frame_objs(objs):
+    """在det结果里找目标字，返回 (字符, 置信度) 或 None"""
+    for obj in objs:
+        text = obj.char_str()
+        for ch in TARGETS:
+            if ch in text:
+                s = getattr(obj, "score", 1.0)
+                if s is None:
+                    s = 1.0
+                if s >= SCORE_TH:
+                    return (ch, s)
+    return None
+
+def ocr_find_char(img_bgr, objs, search_center=None, allow_grid=True):
+    """旋转整帧重检：0°(已det)+象限+网格，全部走det内置识别（唯一可靠路径）"""
+    res = _match_frame_objs(objs)
+    if res is not None:
+        return (res[0], res[1], 0)
+    angles = []
+    if search_center is not None:
+        angles.append(search_center % 360)
+    for a in (90, 180, 270):
+        angles.append(a)
+    if allow_grid:
+        for a in range(30, 360, 30):
+            if a % 90 != 0:
+                angles.append(a)
+    for a in angles:
+        res = _match_frame_objs(ocr.detect(_rotate_frame_cv2(img_bgr, a)))
+        if res is not None:
+            return (res[0], res[1], a)
+    return None
+# ============== 结束OCR部分 ==============
+
 # 初始化神经网络分类器
 #classifier = nn.Classifier(model="/root/ABC3/model_146973.mud")
 
@@ -532,6 +616,117 @@ while not app.need_exit():
             if data_in == b'\x04':
                 data = data_in
                 break
+    # 任务五：OCR识别冠/亚/季（支持任意角度，停稳后识别）
+    elif data == b'\x05':
+        led.value(1)
+        try:
+            ocr_model = ensure_ocr()
+        except Exception as e:
+            print("OCR init failed:", e)
+            data = None
+            continue
+        last_char = None
+        confirm = 0
+        track = None      # (cx, cy, w, h) 跟踪窗
+        lost_count = 0
+        refresh_count = 0
+        last_angle = 0.0  # 上次成功识别的旋转角
+        fcount = 0        # 网格限频计数
+        while True:
+            img = cam.read()
+            t = time.ticks_ms()
+            char = None
+            score = 0.0
+            angle = 0.0
+            cx = cy = 0
+            box_w = box_h = 0
+
+            img_bgr = img.to_format(image.Format.FMT_BGR888)  # OCR模型要求BGR输入
+
+            if track is None:
+                # 全图搜索：原图det（角度0）→ 未命中则旋转整帧重检
+                objs = ocr_model.detect(img_bgr)
+                # 最大框中心作为上报位置（旋转重检时沿用原图坐标）
+                best_box = None  # (points, w, h)
+                best_area = 0
+                for obj in objs:
+                    raw_pts = obj.box.to_list()  # 原始扁平坐标，draw_keypoints要求List[int]
+                    img.draw_keypoints(raw_pts, image.COLOR_RED, 4, -1, 1)
+                    points = normalize_points(raw_pts)
+                    xs = [p[0] for p in points]
+                    ys = [p[1] for p in points]
+                    area = (max(xs) - min(xs)) * (max(ys) - min(ys))
+                    if area > best_area:
+                        best_area = area
+                        best_box = (points, max(xs) - min(xs), max(ys) - min(ys))
+                fcount += 1
+                res = ocr_find_char(img_bgr, objs, None, allow_grid=(fcount % GRID_EVERY == 0))
+                if res is not None:
+                    char, score, angle = res
+                    last_angle = angle
+                    if best_box is not None:
+                        points, bw, bh = best_box
+                        xs = [p[0] for p in points]
+                        ys = [p[1] for p in points]
+                        cx = (min(xs) + max(xs)) // 2
+                        cy = (min(ys) + max(ys)) // 2
+                        box_w, box_h = bw, bh
+                if char is not None and score >= SCORE_TH:
+                    # 锁定跟踪窗（放大，防抖动出窗）
+                    track = (cx, cy, box_w * TRACK_SCALE, box_h * TRACK_SCALE)
+                    lost_count = 0
+                    refresh_count = 0
+            else:
+                # 跟踪：用上次成功角度旋转整帧一次，det+rec（复制正放可靠路径）
+                tx, ty, tw, th = track
+                img.draw_rect(int(tx - tw / 2), int(ty - th / 2), int(tw), int(th), image.COLOR_YELLOW, thickness=1)
+                res = _match_frame_objs(ocr_model.detect(_rotate_frame_cv2(img_bgr, last_angle)))
+                if res is not None:
+                    char, score, angle = res[0], res[1], last_angle
+                    cx, cy = tx, ty
+                    lost_count = 0
+                else:
+                    lost_count += 1
+                    if lost_count >= LOST_RESET:
+                        track = None
+                refresh_count += 1
+                if refresh_count >= REFRESH_EVERY:
+                    track = None  # 定期全图刷新坐标
+
+            # 多帧确认（低分视为未识别，只接受冠/亚/季）
+            if char is not None and score >= SCORE_TH:
+                if char == last_char:
+                    confirm = min(confirm + 1, CONFIRM_FRAMES)
+                else:
+                    last_char = char
+                    confirm = 1
+            else:
+                last_char = None
+                confirm = 0
+
+            data1 = data2 = data3 = data4 = 0
+            if confirm >= CONFIRM_FRAMES:
+                data1 = TARGETS[char]
+                data3 = cx
+                data4 = cy
+                if ocr_font_ok:
+                    img.draw_string(cx + 10, cy + 10, "%s:%d" % (char, data1), image.COLOR_RED)
+                else:
+                    img.draw_string(cx + 10, cy + 10, "code:%d" % data1, image.COLOR_RED)
+                find_circles_ABC(data1, data2, data3, data4)
+
+            disp.show(img)
+
+            # 检查是否退出任务五
+            data_in = serial0.read()
+            if data_in == b'\x04':
+                data = data_in
+                break
+
+            # fps = 1000 / (time.ticks_ms() - t)
+            # print(f"FPS: {fps:.1f}, char: {char}, score: {score:.2f}")
+
+            frame_count += 1
     # 显示图像
     disp.show(img)
     # 短暂延迟，避免CPU过载
