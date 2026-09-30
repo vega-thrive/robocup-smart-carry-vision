@@ -1,8 +1,10 @@
-id: lyh_8_13
-name: 椭圆算法视觉
+id: txs_9_27
+name: 滕鑫胜9月new
 version: 1.0.0
-author: lyh
+author: TXS
 icon: app.png
-desc: lyh
+desc: TXS
 files:
+  - app.png
+  - app.yaml
   - main.py

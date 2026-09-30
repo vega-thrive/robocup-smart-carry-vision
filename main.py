@@ -2,10 +2,6 @@ from maix import image, camera, display, app, time, uart, nn
 import numpy as np 
 import cv2
 import math
-from maix import gpio, pinmap, time
-pinmap.set_pin_function("B3", "GPIOB3")
-led = gpio.GPIO("GPIOB3", gpio.Mode.OUT)
-led.value(0)
 
 # 初始化摄像头和显示器
 cam = camera.Camera(320, 240, fps=30)
@@ -199,12 +195,10 @@ def detect_circle_2(img,MIN_AREA):
 # ============== OCR识别部分（任务05：冠/亚/季，支持任意角度） ==============
 OCR_MODEL = "/root/models/pp_ocr.mud"
 TARGETS = {"冠": 11, "亚": 22, "季": 33}   # 字符 -> 串口码
-SCORE_TH = 0.6       # 置信度阈值，低于视为未识别
-CONFIRM_FRAMES = 3   # 连续确认帧数，防闪烁
-TRACK_SCALE = 1.8    # 跟踪窗相对检测框的放大倍数
-LOST_RESET = 3       # 跟踪连续丢失帧数，超限回退全图搜索
-REFRESH_EVERY = 10   # 跟踪中每N帧强制全图刷新一次坐标
-GRID_EVERY = 3       # 全角度兜底网格限频：每N帧才跑一次（空场景防烧算力）
+ALIAS = {"业": "亚"}       # 模型把"亚"读成"业"，别名补偿
+STEP = 15                  # 旋转投票步长（15°×24=360°，用户验证通过）
+ROI_SCALE = 2.5            # ROI = 检测框 × 2.5（防旋转裁剪 + 裁掉背景）
+MIN_VOTES = 2              # 判定所需最少票数
 
 ocr = None
 ocr_font_loaded = False
@@ -231,53 +225,24 @@ def normalize_points(pts):
         return pts
     return list(zip(pts[0::2], pts[1::2]))
 
-def _rotate_frame_cv2(img_bgr, angle):
-    """cv2旋转整帧（紧致画布防裁剪），供旋转重检使用"""
-    img_cv = image.image2cv(img_bgr)  # BGR
-    h, w = img_cv.shape[:2]
-    rad = math.radians(angle % 360)
-    cos_a = abs(math.cos(rad))
-    sin_a = abs(math.sin(rad))
-    new_w = int(w * cos_a + h * sin_a)
-    new_h = int(w * sin_a + h * cos_a)
-    M = cv2.getRotationMatrix2D((w / 2, h / 2), angle % 360, 1.0)
-    M[0, 2] += (new_w - w) / 2
-    M[1, 2] += (new_h - h) / 2
-    rot = cv2.warpAffine(img_cv, M, (new_w, new_h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
-    return image.cv2image(rot)
-
-def _match_frame_objs(objs):
-    """在det结果里找目标字，返回 (字符, 置信度) 或 None"""
-    for obj in objs:
-        text = obj.char_str()
-        for ch in TARGETS:
-            if ch in text:
-                s = getattr(obj, "score", 1.0)
-                if s is None:
-                    s = 1.0
-                if s >= SCORE_TH:
-                    return (ch, s)
-    return None
-
-def ocr_find_char(img_bgr, objs, search_center=None, allow_grid=True):
-    """旋转整帧重检：0°(已det)+象限+网格，全部走det内置识别（唯一可靠路径）"""
-    res = _match_frame_objs(objs)
-    if res is not None:
-        return (res[0], res[1], 0)
-    angles = []
-    if search_center is not None:
-        angles.append(search_center % 360)
-    for a in (90, 180, 270):
-        angles.append(a)
-    if allow_grid:
-        for a in range(30, 360, 30):
-            if a % 90 != 0:
-                angles.append(a)
-    for a in angles:
-        res = _match_frame_objs(ocr.detect(_rotate_frame_cv2(img_bgr, a)))
-        if res is not None:
-            return (res[0], res[1], a)
-    return None
+def get_rotate_points_flat(cx, cy, angle_deg, w, h):
+    """三点仿射旋转：源(0,0)(w,0)(0,h)绕中心旋转angle_deg（MaixPy affine用，用户验证）"""
+    src_pts = [(0, 0), (w, 0), (0, h)]
+    rad = math.radians(angle_deg)
+    cos_a = math.cos(rad)
+    sin_a = math.sin(rad)
+    src_flat = []
+    dst_flat = []
+    for x, y in src_pts:
+        tx = x - cx
+        ty = y - cy
+        rx = tx * cos_a - ty * sin_a + cx
+        ry = tx * sin_a + ty * cos_a + cy
+        src_flat.append(int(x))
+        src_flat.append(int(y))
+        dst_flat.append(int(rx))
+        dst_flat.append(int(ry))
+    return src_flat, dst_flat
 # ============== 结束OCR部分 ==============
 
 # 初始化神经网络分类器
@@ -293,18 +258,27 @@ numB = 0
 numC = 0
 numD = 0
 
-# 色块的颜色配置
-#thresholds_1 = [[0, 80, 40, 80, 10, 80]]      # red
-#thresholds_2 = [[20, 70, -20, 5, -40, 0]]   # blue [0, 45, -35, 45, -45, -5][20, 50, -15, 5, -40, 0]
-#thresholds_3 = [[20, 75, -55, -15, 5, 45]]    # green
-#thresholds_4 = [[55, 85, -10, 10, -10, 20]]   # white[50, 75, -15, 25, -10, 15]
-#thresholds_5 = [[0, 25, -10, 10, -15, 5]]    # black
-# 色块的颜色配置（容错加宽版，推荐用这个）
-thresholds_1 = [[24, 29, 46, 51, 25, 31]]      # red 红色
-thresholds_2 = [[44, 48, -15, -8, -28, -22]]   # blue 蓝色
-thresholds_3 = [[32, 37, -36, -31, 16, 21]]    # green 绿色
-thresholds_4 = [[53, 58, -2, 3, 2, 8]]        # white 白色
-thresholds_5 = [[4, 8, -2, 3, -4, 1]]         # black 黑色
+# 任务三配置（新规则对象：红/蓝圆柱、红/蓝长方体、黄圆锥，正俯视识别）
+TH_RED    = [20, 85, 25, 90, 15, 70]      # 红色（用户实测宽版）
+TH_BLUE   = [20, 85, -40, 10, -50, -10]   # 蓝色
+TH_YELLOW = [30, 90, 5, 40, 30, 80]       # 黄色
+MIN_AREA = 300                            # 最小色块像素数
+CIRCLE_ROUNDNESS_MIN = 0.85               # 圆度下限（圆柱判据）
+RECTANGULARITY_MIN = 0.65                 # 矩形度下限（旋转矩形圆度虚高时防误判）
+CODE_MAP3 = {("Red", "cyl"): 31, ("Red", "box"): 32,
+             ("Blue", "cyl"): 33, ("Blue", "box"): 34}
+
+def classify_shape(blob):
+    """圆度+矩形度判别：圆度≥0.85且矩形度≥0.65=圆柱(cyl)，其余=长方体(box)"""
+    area = blob.pixels()
+    per = blob.perimeter()
+    w = blob[2]
+    h = blob[3]
+    roundness = (4 * math.pi * area) / (per * per) if per > 0 else 0.0
+    rectangularity = area / (w * h) if w * h > 0 else 0.0
+    if roundness >= CIRCLE_ROUNDNESS_MIN and rectangularity >= RECTANGULARITY_MIN:
+        return "cyl"
+    return "box"
 def find_circles_ABC(data1, data2, data3, data4):
     """打包并发送数据"""
     # 将数据项转换为字节数据，确保值在0-255范围内
@@ -335,9 +309,7 @@ def find_circles_ABC(data1, data2, data3, data4):
     # print(f"Values: data1={data1}, data2={data2}, data3={data3}, data4={data4}")
 
 # 主循环
-#led.toggle()
 while not app.need_exit():
-    led.value(0)
     img = cam.read()
     # 串口接收数据（读1字节，没数据就继续等，不再强制进入任务一）
     data = serial0.read(1)
@@ -347,7 +319,6 @@ while not app.need_exit():
         continue
     # 任务一：圆检测
     if data == b'\x01':
-        led.value(0)
         while True:
               
             img = cam.read()
@@ -408,7 +379,6 @@ while not app.need_exit():
     # 任务er：圆检测
     #识别冠亚
     elif data == b'\x02':
-        led.value(1)
         while True:
             
             img = cam.read()
@@ -469,7 +439,6 @@ while not app.need_exit():
     
     # 任务六：圆检测
     elif data == b'\x06':
-        led.value(1)
         while True:
             
             img = cam.read()
@@ -527,193 +496,135 @@ while not app.need_exit():
             
             # 增加帧计数器
             frame_count += 1
-    # 任务三：色块识别
+    # 任务三：红/蓝/黄对象识别（31红圆柱 32红长方体 33蓝圆柱 34蓝长方体 35黄圆锥）
     elif data == b'\x03':
-        # 初始化状态变量
-        led.value(0)
-        last_detected_color = None
-        detection_confidence = 0
-        MAX_CONFIDENCE = 3  # 连续检测到3帧才确认颜色
-    
+        last_code = None
+        confidence = 0
         while True:
             img = cam.read()
-            img_maix = img.copy()
-        
-             # 定义中心区域ROI
-            roi_center = (110, 90, 130, 110)  # (x, y, w, h) 调大并下移
-            img_maix.draw_rect(110, 90, 130, 110, image.COLOR_WHITE)
-        
-            # 初始化数据
+            img.gaussian(2)  # 平滑降噪
+
+            # 颜色定位：三色各取最大色块，再取全局最大
+            best = None
+            for name, th in (("Red", TH_RED), ("Blue", TH_BLUE), ("Yellow", TH_YELLOW)):
+                blobs = img.find_blobs([th], pixels_threshold=MIN_AREA)
+                if blobs:
+                    b = max(blobs, key=lambda x: x.pixels())
+                    if best is None or b.pixels() > best[1].pixels():
+                        best = (name, b)
+
             data1 = data2 = data3 = data4 = 0
-            current_color = None
-        
-            # 同时检测所有颜色
-            red_blobs = img.find_blobs(thresholds_1, area_threshold=1000, pixels_threshold=1000, roi=roi_center)
-            blue_blobs = img.find_blobs(thresholds_2, area_threshold=1000, pixels_threshold=1000, roi=roi_center)
-            green_blobs = img.find_blobs(thresholds_3, area_threshold=1000, pixels_threshold=1000, roi=roi_center)
-            white_blobs = img.find_blobs(thresholds_4, area_threshold=3000, pixels_threshold=3000, roi=roi_center)
-            black_blobs = img.find_blobs(thresholds_5, area_threshold=4000, pixels_threshold=4000, roi=roi_center)
-        
-            # 选择最显著的色块（面积最大）
-            all_blobs = []
-            if red_blobs:
-                all_blobs.extend([(blob, "Red", 21) for blob in red_blobs])
-            if blue_blobs:
-                all_blobs.extend([(blob, "Blue", 22) for blob in blue_blobs])
-            if green_blobs:
-                all_blobs.extend([(blob, "Green", 23) for blob in green_blobs])
-            if white_blobs:
-                all_blobs.extend([(blob, "White", 24) for blob in white_blobs])
-            if black_blobs:
-                all_blobs.extend([(blob, "Black", 25) for blob in black_blobs])
-        
-            # 如果有检测到色块
-            if all_blobs:
-                # 选择面积最大的色块
-                largest_blob = max(all_blobs, key=lambda x: x[0].area())
-                blob, color_name, color_code = largest_blob
-            
-                # 绘制检测结果
-                img_maix.draw_rect(blob[0], blob[1], blob[2], blob[3], image.COLOR_GREEN)
-                img_maix.draw_string(blob[0], blob[1] - 10, color_name, image.COLOR_BLACK)
-            
-                # 更新颜色状态
-                if color_name == last_detected_color:
-                    detection_confidence = min(detection_confidence + 1, MAX_CONFIDENCE)
+            if best is not None:
+                color, blob = best
+                cx, cy = blob.cx(), blob.cy()
+                img.draw_rect(blob[0], blob[1], blob[2], blob[3], image.COLOR_GREEN, thickness=2)
+                if color == "Yellow":
+                    data1 = 35  # 黄圆锥（颜色唯一）
                 else:
-                    detection_confidence = 1
-                    last_detected_color = color_name
-            
-                # 达到置信度阈值时发送数据
-                if detection_confidence >= MAX_CONFIDENCE:
-                    data1 = color_code
-                    current_color = color_name
+                    shape = classify_shape(blob)
+                    data1 = CODE_MAP3.get((color, shape), 0)
+                data3 = cx
+                data4 = cy
+
+            # 3帧同码确认防抖（确认后才发串口）
+            if data1 != 0 and data1 == last_code:
+                confidence = min(confidence + 1, 3)
             else:
-                # 没有检测到色块
-                detection_confidence = max(0, detection_confidence - 1)
-                if detection_confidence == 0 and last_detected_color:
-                # 发送无颜色状态
-                    data1 = 0
-                    last_detected_color = None
-        
-            # 发送数据
-            if data1 != 0:
+                last_code = data1
+                confidence = 1 if data1 != 0 else 0
+
+            if confidence >= 3:
                 find_circles_ABC(data1, data2, data3, data4)
-        
-            # 显示图像
-            disp.show(img_maix)
-        
-            # 显示当前状态（注释掉以提升帧率）
-            # if current_color:
-            #     print(f"检测到颜色: {current_color} (置信度: {detection_confidence}/{MAX_CONFIDENCE})")
-            # elif last_detected_color and detection_confidence > 0:
-            #     print(f"颜色丢失中: {last_detected_color} (置信度: {detection_confidence}/{MAX_CONFIDENCE})")
-            # else:
-            #     print("未检测到颜色")
-        
+
+            disp.show(img)
+
             # 检查是否退出任务三
             data_in = serial0.read()
             if data_in == b'\x04':
                 data = data_in
                 break
-    # 任务五：OCR识别冠/亚/季（支持任意角度，停稳后识别）
+
+            frame_count += 1
+    # 任务五：OCR识别冠/亚/季（旋转投票法：ROI 15°×24 旋转 + det计数，停稳后识别）
     elif data == b'\x05':
-        led.value(1)
         try:
             ocr_model = ensure_ocr()
         except Exception as e:
             print("OCR init failed:", e)
             data = None
             continue
-        last_char = None
-        confirm = 0
-        track = None      # (cx, cy, w, h) 跟踪窗
-        lost_count = 0
-        refresh_count = 0
-        last_angle = 0.0  # 上次成功识别的旋转角
-        fcount = 0        # 网格限频计数
         while True:
             img = cam.read()
-            t = time.ticks_ms()
-            char = None
-            score = 0.0
-            angle = 0.0
-            cx = cy = 0
-            box_w = box_h = 0
-
             img_bgr = img.to_format(image.Format.FMT_BGR888)  # OCR模型要求BGR输入
 
-            if track is None:
-                # 全图搜索：原图det（角度0）→ 未命中则旋转整帧重检
-                objs = ocr_model.detect(img_bgr)
-                # 最大框中心作为上报位置（旋转重检时沿用原图坐标）
-                best_box = None  # (points, w, h)
-                best_area = 0
-                for obj in objs:
-                    raw_pts = obj.box.to_list()  # 原始扁平坐标，draw_keypoints要求List[int]
-                    img.draw_keypoints(raw_pts, image.COLOR_RED, 4, -1, 1)
-                    points = normalize_points(raw_pts)
-                    xs = [p[0] for p in points]
-                    ys = [p[1] for p in points]
-                    area = (max(xs) - min(xs)) * (max(ys) - min(ys))
-                    if area > best_area:
-                        best_area = area
-                        best_box = (points, max(xs) - min(xs), max(ys) - min(ys))
-                fcount += 1
-                res = ocr_find_char(img_bgr, objs, None, allow_grid=(fcount % GRID_EVERY == 0))
-                if res is not None:
-                    char, score, angle = res
-                    last_angle = angle
-                    if best_box is not None:
-                        points, bw, bh = best_box
-                        xs = [p[0] for p in points]
-                        ys = [p[1] for p in points]
-                        cx = (min(xs) + max(xs)) // 2
-                        cy = (min(ys) + max(ys)) // 2
-                        box_w, box_h = bw, bh
-                if char is not None and score >= SCORE_TH:
-                    # 锁定跟踪窗（放大，防抖动出窗）
-                    track = (cx, cy, box_w * TRACK_SCALE, box_h * TRACK_SCALE)
-                    lost_count = 0
-                    refresh_count = 0
-            else:
-                # 跟踪：用上次成功角度旋转整帧一次，det+rec（复制正放可靠路径）
-                tx, ty, tw, th = track
-                img.draw_rect(int(tx - tw / 2), int(ty - th / 2), int(tw), int(th), image.COLOR_YELLOW, thickness=1)
-                res = _match_frame_objs(ocr_model.detect(_rotate_frame_cv2(img_bgr, last_angle)))
-                if res is not None:
-                    char, score, angle = res[0], res[1], last_angle
-                    cx, cy = tx, ty
-                    lost_count = 0
-                else:
-                    lost_count += 1
-                    if lost_count >= LOST_RESET:
-                        track = None
-                refresh_count += 1
-                if refresh_count >= REFRESH_EVERY:
-                    track = None  # 定期全图刷新坐标
-
-            # 多帧确认（低分视为未识别，只接受冠/亚/季）
-            if char is not None and score >= SCORE_TH:
-                if char == last_char:
-                    confirm = min(confirm + 1, CONFIRM_FRAMES)
-                else:
-                    last_char = char
-                    confirm = 1
-            else:
-                last_char = None
-                confirm = 0
+            # 0° det 定位最大框（任意角度都出框）
+            box = None
+            best_area = 0
+            for obj in ocr_model.detect(img_bgr):
+                raw_pts = obj.box.to_list()  # 原始扁平坐标，draw_keypoints要求List[int]
+                img.draw_keypoints(raw_pts, image.COLOR_RED, 4, -1, 1)
+                pts = normalize_points(raw_pts)
+                xs = [p[0] for p in pts]
+                ys = [p[1] for p in pts]
+                bw = max(xs) - min(xs)
+                bh = max(ys) - min(ys)
+                area = bw * bh
+                if area > best_area:
+                    best_area = area
+                    box = ((min(xs) + max(xs)) // 2, (min(ys) + max(ys)) // 2, bw, bh)
 
             data1 = data2 = data3 = data4 = 0
-            if confirm >= CONFIRM_FRAMES:
-                data1 = TARGETS[char]
-                data3 = cx
-                data4 = cy
-                if ocr_font_ok:
-                    img.draw_string(cx + 10, cy + 10, "%s:%d" % (char, data1), image.COLOR_RED)
-                else:
-                    img.draw_string(cx + 10, cy + 10, "code:%d" % data1, image.COLOR_RED)
-                find_circles_ABC(data1, data2, data3, data4)
+            if box is not None:
+                cx, cy, bw, bh = box
+                roi_size = max(60, int(max(bw, bh) * ROI_SCALE))
+                if roi_size <= 320 and roi_size <= 240:
+                    x = max(0, min(cx - roi_size // 2, 320 - roi_size))
+                    y = max(0, min(cy - roi_size // 2, 240 - roi_size))
+                    roi = img.crop(x, y, roi_size, roi_size)
+                    img.draw_rect(x, y, roi_size, roi_size, image.COLOR_YELLOW, thickness=1)
+                    # 15°×24 旋转投票
+                    counts = {"冠": 0, "亚": 0, "季": 0}
+                    rw = roi.width()
+                    rh = roi.height()
+                    ocr_w = ocr_model.input_width()
+                    ocr_h = ocr_model.input_height()
+                    for a in range(0, 360, STEP):
+                        src, dst = get_rotate_points_flat(rw / 2, rh / 2, a, rw, rh)
+                        rot = roi.affine(src, dst, width=rw, height=rh)
+                        ocr_input = rot.resize(ocr_w, ocr_h)
+                        ocr_input_bgr = image.Image(ocr_w, ocr_h, image.Format.FMT_BGR888)
+                        ocr_input_bgr.draw_image(0, 0, ocr_input)
+                        for obj in ocr_model.detect(ocr_input_bgr):
+                            ch = ALIAS.get(obj.char_str(), obj.char_str())  # 业→亚
+                            if ch in counts:
+                                counts[ch] += 1
+                        # 扫描中响应0x04退出，不必等满一轮
+                        if serial0.read() == b'\x04':
+                            data = b'\x04'
+                            break
+                    if data == b'\x04':
+                        break
+                    # 判定：票数最高且≥MIN_VOTES且严格领先
+                    winner = None
+                    win_votes = 0
+                    for c, v in counts.items():
+                        if v > win_votes:
+                            winner = c
+                            win_votes = v
+                    second = 0
+                    for c, v in counts.items():
+                        if c != winner and v > second:
+                            second = v
+                    if winner is not None and win_votes >= MIN_VOTES and win_votes > second:
+                        data1 = TARGETS[winner]
+                        data3 = cx
+                        data4 = cy
+                        if ocr_font_ok:
+                            img.draw_string(cx + 10, cy + 10, "%s:%d(%d票)" % (winner, data1, win_votes), image.COLOR_RED)
+                        else:
+                            img.draw_string(cx + 10, cy + 10, "code:%d(%d)" % (data1, win_votes), image.COLOR_RED)
+                        find_circles_ABC(data1, data2, data3, data4)
+                        print("识别确认:", winner, "票数:", win_votes, "/24")
 
             disp.show(img)
 
@@ -722,9 +633,6 @@ while not app.need_exit():
             if data_in == b'\x04':
                 data = data_in
                 break
-
-            # fps = 1000 / (time.ticks_ms() - t)
-            # print(f"FPS: {fps:.1f}, char: {char}, score: {score:.2f}")
 
             frame_count += 1
     # 显示图像
