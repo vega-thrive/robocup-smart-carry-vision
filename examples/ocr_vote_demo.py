@@ -142,17 +142,18 @@ def main():
                 x = max(0, min(cx - size // 2, W - size))
                 y = max(0, min(cy - size // 2, H - size))
                 roi = img.crop(x, y, size, size)
-                img.draw_rect(x, y, size, size, image.COLOR_YELLOW, 1)
+                img.draw_rect(x, y, size, size, image.COLOR_YELLOW, thickness=1)
 
                 ch, votes, counts = vote_ocr(model, roi)
+                ty = y - 22 if y >= 22 else y + size + 2   # 别画到画面外
                 if ch:
                     code = TARGETS[ch]
-                    img.draw_rect(x, y, size, size, image.COLOR_GREEN, 2)
+                    img.draw_rect(x, y, size, size, image.COLOR_GREEN, thickness=2)
                     if font_ok:
-                        img.draw_string(x + 2, y - 22, "%s  %d/%d" % (ch, votes, 24),
+                        img.draw_string(x + 2, ty, "%s  %d/%d" % (ch, votes, 24),
                                         image.COLOR_GREEN)
                     else:
-                        img.draw_string(x + 2, y - 22, "code %d  %d/24" % (code, votes),
+                        img.draw_string(x + 2, ty, "code %d  %d/24" % (code, votes),
                                         image.COLOR_GREEN)
                     print("识别: %s (code=%d) 票数 %d/24  %s" % (ch, code, votes, counts))
                 else:
