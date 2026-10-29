@@ -1,9 +1,9 @@
-id: txs_9_27
-name: 滕鑫胜9月new
+id: banyun_vision
+name: 搬运视觉 OCR
 version: 1.0.0
-author: TXS
+author: 滕鑫胜
 icon: app.png
-desc: TXS
+desc: 低算力平台上的任意角度字符识别（15°×24 旋转投票）+ 霍夫圆对准 + 色块形状判别，UART 与主控通信
 files:
   - app.png
   - app.yaml
