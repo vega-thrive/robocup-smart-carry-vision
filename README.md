@@ -143,6 +143,8 @@ MaixCAM 的算力太低，能直接套的现成方案几乎没有：模板匹配
 ├── test_color.py              # HSV 阈值试验
 ├── test_03.py                 # 任务三物块识别试验
 ├── test_05.py                 # 任务五 OCR 试验
+├── examples/
+│   └── ocr_vote_demo.py       # 独立可跑的 OCR demo（去掉串口与任务分发，可直接移植）
 ├── experiments/
 │   └── legacy_ocr/            # 传统方法阶段的样本（原图 + 二值化）
 └── dist/                      # 历史打包产物（.zip 为可烧录的 app 包）
